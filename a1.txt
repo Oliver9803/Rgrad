@@ -1,0 +1,95 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from sklearn.utils.class_weight import compute_class_weight
+import numpy as np
+
+class PriceMovementDataset(Dataset):
+    def __init__(self, data, labels):
+        self.data = data
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return {'input': torch.tensor(self.data[idx], dtype=torch.float32), 'label': torch.tensor(self.labels[idx], dtype=torch.long)}
+
+class TransformerModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, n_layers, dropout=0.2):
+        super(TransformerModel, self).__init__()
+        self.transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=input_dim, nhead=8), num_layers=2)
+        self.fc = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x):
+        x = self.transformer(x)
+        x = x[:, -1, :]
+        x = self.fc(x)
+        return x
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, n_layers, dropout=0.2):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, n_layers, batch_first=True, dropout=dropout)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x, _ = self.lstm(x)
+        x = x[:, -1, :]
+        x = self.fc(x)
+        return x
+
+class GRUModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, n_layers, dropout=0.2):
+        super(GRUModel, self).__init__()
+        self.gru = nn.GRU(input_dim, hidden_dim, n_layers, batch_first=True, dropout=dropout)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x, _ = self.gru(x)
+        x = x[:, -1, :]
+        x = self.fc(x)
+        return x
+
+class RNNModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, n_layers, dropout=0.2):
+        super(RNNModel, self).__init__()
+        self.rnn = nn.RNN(input_dim, hidden_dim, n_layers, batch_first=True, dropout=dropout)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x, _ = self.rnn(x)
+        x = x[:, -1, :]
+        x = self.fc(x)
+        return x
+
+data = np.random.rand(1000, 7, 10)  # (batch_size, seq_len, feature)
+labels = np.random.randint(0, 2, 1000)  # Binary classification
+dataset = PriceMovementDataset(data, labels)
+dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+class_weights = compute_class_weight('balanced', classes=np.unique(labels), y=labels)
+class_weights = torch.tensor(class_weights, dtype=torch.float)
+models = {
+    'Transformer': TransformerModel(input_dim=10, hidden_dim=20, output_dim=2, n_layers=2),
+    'LSTM': LSTMModel(input_dim=10, hidden_dim=20, output_dim=2, n_layers=2),
+    'GRU': GRUModel(input_dim=10, hidden_dim=20, output_dim=2, n_layers=2),
+    'RNN': RNNModel(input_dim=10, hidden_dim=20, output_dim=2, n_layers=2),
+}
+criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+for model_name, model in models.items():
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    num_epochs = 10
+    print(f"Training {model_name} model:")
+    for epoch in range(num_epochs):
+        model.train()
+        for batch in dataloader:
+            inputs = batch['input']
+            targets = batch['label']
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+        print(f'Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}')
