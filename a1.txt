@@ -93,3 +93,107 @@ for model_name, model in models.items():
             loss.backward()
             optimizer.step()
         print(f'Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}')
+
+
+
+
+import pandas as pd
+import numpy as np
+
+# Sample data generation (replace with your actual data)
+np.random.seed(0)
+dates = pd.date_range('2023-01-01', periods=200)
+returns = np.random.randn(200) / 100  # Assuming daily returns in decimal form (e.g., 0.01 for 1%)
+
+data = pd.DataFrame({'Date': dates, 'Return': returns}).set_index('Date')
+
+# Momentum Indicators
+def calculate_momentum(series, period=90):
+    return series - series.shift(period)
+
+data['momentum_90'] = calculate_momentum(data['Return'], 90)
+data['momentum_14'] = calculate_momentum(data['Return'], 14)
+data['momentum_30'] = calculate_momentum(data['Return'], 30)
+
+# Relative Strength Index (RSI)
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+data['rsi_14'] = calculate_rsi(data['Return'])
+
+# Moving Averages
+data['sma_90'] = data['Return'].rolling(window=90).mean()
+data['ema_90'] = data['Return'].ewm(span=90, adjust=False).mean()
+data['sma_30'] = data['Return'].rolling(window=30).mean()
+data['ema_30'] = data['Return'].ewm(span=30, adjust=False).mean()
+
+# Bollinger Bands
+def calculate_bollinger_bands(series, window=20, num_std=2):
+    rolling_mean = series.rolling(window).mean()
+    rolling_std = series.rolling(window).std()
+    upper_band = rolling_mean + (rolling_std * num_std)
+    lower_band = rolling_mean - (rolling_std * num_std)
+    return upper_band, rolling_mean, lower_band
+
+data['bb_high'], data['bb_mid'], data['bb_low'] = calculate_bollinger_bands(data['Return'])
+
+# Average True Range (ATR) approximation using returns only
+def calculate_atr(return_series, period=14):
+    true_range = return_series.abs()
+    atr = true_range.rolling(window=period).mean()
+    return atr
+
+data['atr_14'] = calculate_atr(data['Return'])
+
+# MACD
+def calculate_macd(series, fast_period=12, slow_period=26, signal_period=9):
+    fast_ema = series.ewm(span=fast_period, adjust=False).mean()
+    slow_ema = series.ewm(span=slow_period, adjust=False).mean()
+    macd = fast_ema - slow_ema
+    signal = macd.ewm(span=signal_period, adjust=False).mean()
+    macd_diff = macd - signal
+    return macd, signal, macd_diff
+
+data['macd'], data['macd_signal'], data['macd_diff'] = calculate_macd(data['Return'])
+
+# Drop rows with NaN values (first few days will have NaNs due to rolling calculations)
+data.dropna(inplace=True)
+
+# Display the data with calculated indicators
+print(data.tail())
+
+# Plot the data (optional)
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(14, 10))
+
+# Plot Returns with SMA and EMA
+plt.subplot(3, 1, 1)
+plt.plot(data['Return'], label='Return')
+plt.plot(data['sma_90'], label='SMA 90', linestyle='--')
+plt.plot(data['ema_90'], label='EMA 90', linestyle='--')
+plt.title('Returns and Moving Averages')
+plt.legend()
+
+# Plot Momentum
+plt.subplot(3, 1, 2)
+plt.plot(data['momentum_90'], label='Momentum 90', color='orange')
+plt.plot(data['rsi_14'], label='RSI 14', color='green')
+plt.title('Momentum Indicators')
+plt.legend()
+
+# Plot Volatility and Trend Indicators
+plt.subplot(3, 1, 3)
+plt.plot(data['atr_14'], label='ATR 14', color='purple')
+plt.plot(data['macd'], label='MACD', color='blue')
+plt.plot(data['macd_signal'], label='MACD Signal', color='red')
+plt.title('Volatility and Trend Indicators')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
