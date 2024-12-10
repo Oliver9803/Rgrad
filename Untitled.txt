@@ -1,40 +1,76 @@
-import pandas as pd
 import numpy as np
-import pickle
+import random
 
-# Create a DataFrame with random 0 or 1 values for demonstration
-np.random.seed(0)  # For reproducibility
-stock_names = [f'Stock{i+1}' for i in range(40)]
-criteria = [f'Criterion {i+1}' for i in range(4)]
-data = np.random.randint(0, 2, size=(40, 4))
-df = pd.DataFrame(data, index=stock_names, columns=criteria)
+# Define stock prices
+prices = np.random.randint(10, 100, size=40)  # Random prices for 40 stocks
 
-def dfs_select_stocks(df, select_count=10, max_size=10000):
-    def dfs(path, index):
-        if len(valid_combinations) >= max_size:
-            save_combinations(valid_combinations, file_count[0])
-            file_count[0] += 1
-            valid_combinations.clear()
+# Fitness function
+def fitness(individual):
+    return -1 * sum(prices[i] for i in range(len(individual)) if individual[i] == 1)
 
-        if len(path) == select_count:
-            if all(0 <= df.loc[path, criterion].sum() <= 5 for criterion in criteria):
-                valid_combinations.append(path.copy())
-            return
+# Generate a random individual with exactly 10 ones
+def generate_individual():
+    individual = [0] * 40
+    indices = random.sample(range(40), 10)
+    for i in indices:
+        individual[i] = 1
+    return individual
 
-        for i in range(index, len(df)):
-            path.append(df.index[i])
-            dfs(path, i + 1)
-            path.pop()
+# Crossover function
+def crossover(parent1, parent2):
+    point = random.randint(1, 39)  # Single-point crossover
+    child1 = parent1[:point] + parent2[point:]
+    child2 = parent2[:point] + parent1[point:]
+    return repair(child1), repair(child2)
 
-    def save_combinations(combinations, count):
-        filename = f'valid_combinations_{count}.pkl'
-        with open(filename, 'wb') as f:
-            pickle.dump(combinations, f)
-        print(f'Saved {len(combinations)} combinations to {filename}')
+# Repair function to ensure exactly 10 ones
+def repair(individual):
+    while sum(individual) > 10:
+        individual[random.choice([i for i in range(40) if individual[i] == 1])] = 0
+    while sum(individual) < 10:
+        individual[random.choice([i for i in range(40) if individual[i] == 0])] = 1
+    return individual
 
-    valid_combinations = []
-    file_count = [1]  # To keep track of file numbering
-    dfs([], 0)
+# Mutation function
+def mutate(individual):
+    i, j = random.sample(range(40), 2)
+    individual[i], individual[j] = individual[j], individual[i]  # Swap two bits
+    return repair(individual)
 
-# Find valid combinations
-dfs_select_stocks(df)
+# Genetic Algorithm
+def genetic_algorithm(pop_size=100, generations=100):
+    population = [generate_individual() for _ in range(pop_size)]
+    best_individual = None
+    best_fitness = float('-inf')
+
+    for gen in range(generations):
+        # Evaluate fitness
+        fitness_scores = [fitness(ind) for ind in population]
+        
+        # Track the best solution
+        max_fitness_idx = np.argmax(fitness_scores)
+        if fitness_scores[max_fitness_idx] > best_fitness:
+            best_fitness = fitness_scores[max_fitness_idx]
+            best_individual = population[max_fitness_idx]
+
+        # Selection (roulette wheel)
+        total_fitness = sum(fitness_scores)
+        probabilities = [f / total_fitness for f in fitness_scores]
+        parents = random.choices(population, weights=probabilities, k=pop_size)
+
+        # Crossover and mutation
+        next_population = []
+        for i in range(0, pop_size, 2):
+            p1, p2 = parents[i], parents[i+1]
+            child1, child2 = crossover(p1, p2)
+            next_population.append(mutate(child1))
+            next_population.append(mutate(child2))
+        
+        population = next_population
+
+    return best_individual, -best_fitness  # Return the best solution and its price
+
+# Run the algorithm
+best_solution, best_price = genetic_algorithm()
+print("Best solution:", best_solution)
+print("Best price:", best_price)
