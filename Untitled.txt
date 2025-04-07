@@ -1,19 +1,35 @@
-import asyncio
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import make_interp_spline
 
-# A synchronous function
-def f(x):
-    # Simulate computation
-    return x * x
+# Create a DataFrame with your data
+data = {
+    'x': [0.5, 1.5, 2.5,3.5,4.5],  # Midpoints of the histogram bins
+    'y': [10, 8, 6,5,4]        # Corresponding frequencies or densities
+}
+df = pd.DataFrame(data)
 
-async def main():
-    # Use asyncio.to_thread to run the synchronous function in parallel
-    tasks = [asyncio.to_thread(f, x) for x in range(1000)]
-    
-    # Run all tasks concurrently and gather the results
-    results = await asyncio.gather(*tasks)
-    
-    # Print or process the results
-    print(results)
+# Extract x and y values from the DataFrame
+x_values = df['x']
+y_values = df['y']
 
-# Run the asyncio event loop
-asyncio.run(main())
+# Interpolate the midpoints to create a smooth curve
+x_smooth = np.linspace(x_values.min(), x_values.max(), 300)
+spline = make_interp_spline(x_values, y_values, k=3)  # Cubic spline interpolation
+y_smooth = spline(x_smooth)
+
+# Plot the histogram (using bar plot since data is already grouped)
+plt.bar(x_values, y_values, width=1.0, color='lightblue', edgecolor='blue', alpha=0.6, label='Histogram')
+
+# Plot the smooth curve
+plt.plot(x_smooth, y_smooth, color='red', label='Interpolated Curve')
+
+# Add labels and legend
+plt.xlabel('X Values')
+plt.ylabel('Y Values')
+plt.title('Histogram with Interpolated Curve')
+plt.legend()
+
+# Show the plot
+plt.show()
