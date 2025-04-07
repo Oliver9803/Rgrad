@@ -33,3 +33,74 @@ plt.legend()
 
 # Show the plot
 plt.show()
+
+
+
+import numpy as np
+from scipy.optimize import minimize
+
+# Example data
+X = np.array([
+    [1, 2],
+    [2, 3],
+    [3, 4],
+    [4, 5],
+    [5, 6]
+])  # Feature matrix (5 samples, 2 features)
+
+Y = np.array([
+    [30, 20],
+    [25, 30],
+    [40, 40],
+    [45, 50],
+    [10, 60]
+])  # Target matrix (5 samples, 2 outputs)
+
+# Dimensions
+n_samples, n_features = X.shape
+_, n_outputs = Y.shape
+
+
+# Objective function: Minimize sum of squared errors (Frobenius norm)
+def objective(beta_flat):
+    beta = beta_flat.reshape(n_features, n_outputs)  # Reshape beta back to 2D
+    predictions = X @ beta  # Predicted matrix
+    return np.sum((predictions - Y) ** 2)  # Frobenius norm
+
+# Constraints: Bounds on predictions (X @ beta)
+prediction_constraints = [
+    {'type': 'ineq', 'fun': lambda beta_flat, i=i, j=j: (
+        (X @ beta_flat.reshape(n_features, n_outputs))[i, j+1] -
+        (X @ beta_flat.reshape(n_features, n_outputs))[i, j]
+    )}  # Monotonicity constraint for feature dimension
+    for i in range(n_samples) for j in range(n_outputs - 1)
+] + [
+    {'type': 'ineq', 'fun': lambda beta_flat, i=i, j=j: (
+        (beta_flat.reshape(n_features, n_outputs))[i, j+1] -
+        (beta_flat.reshape(n_features, n_outputs))[i, j]
+    )}
+    for i in range(n_features) for j in range(n_outputs - 1)
+]
+
+
+# Initial guess for beta
+initial_guess = np.zeros(n_features * n_outputs)  # Flattened initial guess
+
+# Solve the optimization problem
+result = minimize(
+    objective,                     # Objective function
+    initial_guess,                 # Initial guess
+    method='SLSQP',                # Sequential Least Squares Programming
+    constraints=prediction_constraints  # Constraints on predictions
+)
+
+# Extract the optimized coefficients
+if result.success:
+    beta_optimized = result.x.reshape(n_features, n_outputs)  # Reshape back to 2D
+    predictions_optimized = X @ beta_optimized
+    print("Optimized Coefficients (beta):")
+    print(beta_optimized)
+    print("Optimized Predictions (X @ beta):")
+    print(predictions_optimized)
+else:
+    print("Optimization failed:", result.message)
