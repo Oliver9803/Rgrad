@@ -1,106 +1,383 @@
-import pandas as pd
+# Requirements:
+# pip install numpy torch scikit-learn
+
+from __future__ import annotations
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.interpolate import make_interp_spline
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import StandardScaler
+from dataclasses import dataclass
+from collections import deque
+from typing import Deque
+import random
 
-# Create a DataFrame with your data
-data = {
-    'x': [0.5, 1.5, 2.5,3.5,4.5],  # Midpoints of the histogram bins
-    'y': [10, 8, 6,5,4]        # Corresponding frequencies or densities
-}
-df = pd.DataFrame(data)
+# ---------------------- Synthetic data (replace with real) ----------------------
+def make_synthetic_data(D=300, T=8, N=1000, seed=42):
+    rng = np.random.default_rng(seed)
+    # Per-day per-stock signal (D, N)
+    signals = rng.normal(0, 1, size=(D, N))
+    # Intraday returns correlated with the signal: distribute alpha across snaps
+    snap_frac = rng.dirichlet(alpha=np.ones(T))  # T nonnegative weights sum to 1
+    alpha_strength = 0.02
+    noise = rng.normal(0, 0.01, size=(D, T, N))
+    intraday_returns = alpha_strength * signals[:, None, :] * snap_frac[None, :, None] + noise
 
-# Extract x and y values from the DataFrame
-x_values = df['x']
-y_values = df['y']
+    # Initial weights proportional to the signals' sign, then normalized later to neutral
+    init_w = signals.copy()
 
-# Interpolate the midpoints to create a smooth curve
-x_smooth = np.linspace(x_values.min(), x_values.max(), 300)
-spline = make_interp_spline(x_values, y_values, k=3)  # Cubic spline interpolation
-y_smooth = spline(x_smooth)
+    return signals.astype(np.float32), intraday_returns.astype(np.float32), init_w.astype(np.float32)
 
-# Plot the histogram (using bar plot since data is already grouped)
-plt.bar(x_values, y_values, width=1.0, color='lightblue', edgecolor='blue', alpha=0.6, label='Histogram')
+# ---------------------- Weight normalization ----------------------
+def normalize_neutral(w: np.ndarray) -> np.ndarray:
+    # Enforce: sum of positives = +1, sum of negatives = -1
+    w = w.astype(np.float32).copy()
+    pos = w > 0
+    neg = w < 0
+    pos_sum = float(w[pos].sum()) if pos.any() else 0.0
+    neg_sum = float(w[neg].sum()) if neg.any() else 0.0  # negative number
 
-# Plot the smooth curve
-plt.plot(x_smooth, y_smooth, color='red', label='Interpolated Curve')
+    if pos_sum > 0:
+        w[pos] /= pos_sum  # scale so sum_pos -> 1
+    if neg_sum < 0:
+        w[neg] /= -neg_sum  # scale so sum_neg -> -1
 
-# Add labels and legend
-plt.xlabel('X Values')
-plt.ylabel('Y Values')
-plt.title('Histogram with Interpolated Curve')
-plt.legend()
+    return w  # If one side missing, the other scales; neutrality in total sum may not be 0 in that edge case.
 
-# Show the plot
-plt.show()
+# ---------------------- Feature scaling ----------------------
+def build_scaler(signals: np.ndarray, rets: np.ndarray) -> StandardScaler:
+    D, N = signals.shape
+    T = rets.shape[1]
+    feats = []
+    rng = np.random.default_rng(0)
+    for d in range(D):
+        sig_d = signals[d]
+        sig_mean = float(sig_d.mean())
+        sig_std = float(sig_d.std() + 1e-12)
+        sig_z = (sig_d - sig_mean) / sig_std
+        ranks = np.argsort(np.argsort(sig_d)) / max(1, N - 1)
+        # sample a subset of stocks to fit scaler efficiently
+        idx = rng.choice(N, size=min(N, 128), replace=False)
+        for t in range(T):
+            rt = rets[d, t]
+            stats = np.array([
+                np.nanmean(rt),
+                np.nanstd(rt) + 1e-12,
+                np.nanpercentile(rt, 10),
+                np.nanpercentile(rt, 50),
+                np.nanpercentile(rt, 90),
+            ], dtype=np.float64)
+            for i in idx:
+                base = np.array([sig_d[i], sig_z[i], ranks[i]], dtype=np.float64)
+                feats.append(np.concatenate([base, stats], axis=0))
+    feats = np.asarray(feats)
+    scaler = StandardScaler()
+    scaler.fit(feats)
+    return scaler
 
+def make_obs(scaler: StandardScaler, signals: np.ndarray, rets: np.ndarray,
+             d: int, t: int, i: int, exited: bool, cum_pnl_i: float, T: int) -> np.ndarray:
+    sig_d = signals[d]
+    N = sig_d.shape[0]
+    sig_mean = float(sig_d.mean())
+    sig_std = float(sig_d.std() + 1e-12)
+    sig_z = (sig_d - sig_mean) / sig_std
+    ranks = np.argsort(np.argsort(sig_d)) / max(1, N - 1)
 
+    rt = rets[d, t]
+    stats = np.array([
+        np.nanmean(rt),
+        np.nanstd(rt) + 1e-12,
+        np.nanpercentile(rt, 10),
+        np.nanpercentile(rt, 50),
+        np.nanpercentile(rt, 90),
+    ], dtype=np.float32)
 
-import numpy as np
-from scipy.optimize import minimize
+    base = np.array([sig_d[i], sig_z[i], ranks[i]], dtype=np.float32)
+    base_scaled = scaler.transform(np.concatenate([base, stats], axis=0).reshape(1, -1)).ravel().astype(np.float32)
 
-# Example data
-X = np.array([
-    [1, 2],
-    [2, 3],
-    [3, 4],
-    [4, 5],
-    [5, 6]
-])  # Feature matrix (5 samples, 2 features)
+    exited_flag = np.float32(1.0 if exited else 0.0)
+    time_progress = np.float32(t / (T - 1 if T > 1 else 1))
+    obs = np.concatenate([base_scaled, np.array([cum_pnl_i, exited_flag, time_progress], dtype=np.float32)], axis=0)
+    return obs  # Dim = 8 scaled + 3 raw = 11
 
-Y = np.array([
-    [30, 20],
-    [25, 30],
-    [40, 40],
-    [45, 50],
-    [10, 60]
-])  # Target matrix (5 samples, 2 outputs)
+# ---------------------- Replay buffer ----------------------
+@dataclass
+class Transition:
+    s: np.ndarray
+    a: int
+    r: float
+    s_next: np.ndarray
+    done: bool
 
-# Dimensions
-n_samples, n_features = X.shape
-_, n_outputs = Y.shape
+class ReplayBuffer:
+    def __init__(self, capacity: int):
+        self.buf: Deque[Transition] = deque(maxlen=capacity)
+    def push(self, s, a, r, s_next, done):
+        self.buf.append(Transition(s.astype(np.float32), int(a), float(r), s_next.astype(np.float32), bool(done)))
+    def sample(self, batch: int):
+        batch_items = random.sample(self.buf, batch)
+        s = torch.tensor(np.stack([b.s for b in batch_items]), dtype=torch.float32)
+        a = torch.tensor([b.a for b in batch_items], dtype=torch.long)
+        r = torch.tensor([b.r for b in batch_items], dtype=torch.float32)
+        s_next = torch.tensor(np.stack([b.s_next for b in batch_items]), dtype=torch.float32)
+        done = torch.tensor([b.done for b in batch_items], dtype=torch.float32)
+        return s, a, r, s_next, done
+    def __len__(self):
+        return len(self.buf)
 
+# ---------------------- Q-network (dueling) ----------------------
+class QNet(nn.Module):
+    def __init__(self, input_dim: int, hidden: int = 256, dueling: bool = True):
+        super().__init__()
+        self.dueling = dueling
+        if dueling:
+            self.feature = nn.Sequential(
+                nn.Linear(input_dim, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, hidden),
+                nn.ReLU(),
+            )
+            self.adv = nn.Sequential(
+                nn.Linear(hidden, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, 2)
+            )
+            self.val = nn.Sequential(
+                nn.Linear(hidden, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, 1)
+            )
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(input_dim, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, 2)
+            )
 
-# Objective function: Minimize sum of squared errors (Frobenius norm)
-def objective(beta_flat):
-    beta = beta_flat.reshape(n_features, n_outputs)  # Reshape beta back to 2D
-    predictions = X @ beta  # Predicted matrix
-    return np.sum((predictions - Y) ** 2)  # Frobenius norm
+    def forward(self, x):
+        if self.dueling:
+            f = self.feature(x)
+            A = self.adv(f)
+            V = self.val(f)
+            return V + (A - A.mean(dim=1, keepdim=True))
+        else:
+            return self.net(x)
 
-# Constraints: Bounds on predictions (X @ beta)
-prediction_constraints = [
-    {'type': 'ineq', 'fun': lambda beta_flat, i=i, j=j: (
-        (X @ beta_flat.reshape(n_features, n_outputs))[i, j+1] -
-        (X @ beta_flat.reshape(n_features, n_outputs))[i, j]
-    )}  # Monotonicity constraint for feature dimension
-    for i in range(n_samples) for j in range(n_outputs - 1)
-] + [
-    {'type': 'ineq', 'fun': lambda beta_flat, i=i, j=j: (
-        (beta_flat.reshape(n_features, n_outputs))[i, j+1] -
-        (beta_flat.reshape(n_features, n_outputs))[i, j]
-    )}
-    for i in range(n_features) for j in range(n_outputs - 1)
-]
+# ---------------------- Agent (shared across stocks) ----------------------
+class PerStockDQN:
+    def __init__(
+        self,
+        signals: np.ndarray,          # (D, N)
+        intraday_returns: np.ndarray, # (D, T, N)
+        init_weights: np.ndarray,     # (D, N)
+        costs_bps: float = 1.0,
+        gamma: float = 1.0,
+        device: str = "cpu",
+        seed: int = 7,
+    ):
+        random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+        self.device = torch.device(device)
 
+        self.signals = signals
+        self.rets = intraday_returns
+        self.init_w_raw = init_weights
+        self.D, self.T, self.N = intraday_returns.shape
+        assert signals.shape == (self.D, self.N)
+        assert init_weights.shape == (self.D, self.N)
 
-# Initial guess for beta
-initial_guess = np.zeros(n_features * n_outputs)  # Flattened initial guess
+        self.exit_cost = costs_bps * 1e-4  # e.g., 1 bps = 0.0001
+        self.gamma = gamma
 
-# Solve the optimization problem
-result = minimize(
-    objective,                     # Objective function
-    initial_guess,                 # Initial guess
-    method='SLSQP',                # Sequential Least Squares Programming
-    constraints=prediction_constraints  # Constraints on predictions
-)
+        # Scaler + obs dim
+        self.scaler = build_scaler(self.signals, self.rets)
+        self.obs_dim = 8 + 3  # 8 scaled features + [cum_pnl_i, exited_flag, time]
 
-# Extract the optimized coefficients
-if result.success:
-    beta_optimized = result.x.reshape(n_features, n_outputs)  # Reshape back to 2D
-    predictions_optimized = X @ beta_optimized
-    print("Optimized Coefficients (beta):")
-    print(beta_optimized)
-    print("Optimized Predictions (X @ beta):")
-    print(predictions_optimized)
-else:
-    print("Optimization failed:", result.message)
+        self.q = QNet(self.obs_dim, hidden=256, dueling=True).to(self.device)
+        self.q_tgt = QNet(self.obs_dim, hidden=256, dueling=True).to(self.device)
+        self.q_tgt.load_state_dict(self.q.state_dict()); self.q_tgt.eval()
+        self.optim = optim.Adam(self.q.parameters(), lr=3e-4)
+
+        self.buffer = ReplayBuffer(capacity=1_000_000)
+
+    def epsilon_greedy(self, q_vals: torch.Tensor, eps: float) -> int:
+        if random.random() < eps:
+            return random.randint(0, 1)
+        return int(torch.argmax(q_vals).item())
+
+    def rollout_day(self, d: int, eps: float):
+        # Normalize to dollar-neutral at the start of day d
+        w = normalize_neutral(self.init_w_raw[d])
+        exited = np.zeros(self.N, dtype=bool)
+        cum_pnl = np.zeros(self.N, dtype=np.float32)
+
+        for t in range(self.T):
+            for i in range(self.N):
+                s_t = make_obs(self.scaler, self.signals, self.rets, d, t, i, exited[i], float(cum_pnl[i]), self.T)
+                with torch.no_grad():
+                    q_vals = self.q(torch.tensor(s_t, device=self.device).unsqueeze(0)).squeeze(0).cpu()
+                a = self.epsilon_greedy(q_vals, eps)
+
+                r = 0.0
+                if (a == 1) and (not exited[i]):
+                    r -= self.exit_cost
+                    exited[i] = True
+                    w[i] = 0.0  # Permanently zero; no renormalization
+
+                if not exited[i]:
+                    pnl_ti = float(w[i] * self.rets[d, t, i])
+                    r += pnl_ti
+                    cum_pnl[i] += pnl_ti
+
+                done = (t == self.T - 1)
+                if not done:
+                    s_tp1 = make_obs(self.scaler, self.signals, self.rets, d, t + 1, i, exited[i], float(cum_pnl[i]), self.T)
+                else:
+                    s_tp1 = np.zeros_like(s_t, dtype=np.float32)
+
+                self.buffer.push(s_t, a, r, s_tp1, done)
+
+    def train_step(self, batch_size: int = 2048, double_dqn: bool = True):
+        if len(self.buffer) < batch_size:
+            return None
+        s, a, r, s_next, done = self.buffer.sample(batch_size)
+        s = s.to(self.device); a = a.to(self.device); r = r.to(self.device)
+        s_next = s_next.to(self.device); done = done.to(self.device)
+
+        q_sa = self.q(s).gather(1, a.unsqueeze(1)).squeeze(1)
+
+        with torch.no_grad():
+            if double_dqn:
+                a_next = self.q(s_next).argmax(dim=1)
+                q_next = self.q_tgt(s_next).gather(1, a_next.unsqueeze(1)).squeeze(1)
+            else:
+                q_next = self.q_tgt(s_next).max(dim=1).values
+            target = r + (1.0 - done) * self.gamma * q_next
+
+        loss = nn.SmoothL1Loss()(q_sa, target)
+        self.optim.zero_grad(); loss.backward()
+        nn.utils.clip_grad_norm_(self.q.parameters(), 1.0)
+        self.optim.step()
+        return float(loss.item())
+
+    def soft_update(self, tau: float = 0.01):
+        with torch.no_grad():
+            for p, p_tgt in zip(self.q.parameters(), self.q_tgt.parameters()):
+                p_tgt.data.mul_(1 - tau).add_(tau * p.data)
+
+    def evaluate(self, n_days: int = 64) -> float:
+        self.q.eval()
+        totals = []
+        with torch.no_grad():
+            idx = np.random.choice(self.D, size=min(n_days, self.D), replace=False)
+            for d in idx:
+                w = normalize_neutral(self.init_w_raw[d])
+                exited = np.zeros(self.N, dtype=bool)
+                total = 0.0
+                for t in range(self.T):
+                    for i in range(self.N):
+                        if exited[i]:
+                            continue
+                        s_t = make_obs(self.scaler, self.signals, self.rets, d, t, i, exited[i], 0.0, self.T)
+                        q_vals = self.q(torch.tensor(s_t, device=self.device).unsqueeze(0)).squeeze(0)
+                        a = int(torch.argmax(q_vals).item())
+                        if a == 1:
+                            total -= self.exit_cost
+                            exited[i] = True
+                            w[i] = 0.0
+                        else:
+                            total += float(w[i] * self.rets[d, t, i])
+                totals.append(total)
+        self.q.train()
+        return float(np.mean(totals))
+
+    def train(
+        self,
+        epochs: int = 150,
+        eps_start: float = 0.2,
+        eps_end: float = 0.01,
+        eps_decay_epochs: int = 120,
+        batch_size: int = 2048,
+        rollouts_per_epoch: int = 64,
+        target_tau: float = 0.01,
+        eval_every: int = 10,
+        stock_subsample: int | None = 128,  # speed-up; set None to use all stocks
+    ):
+        for epoch in range(1, epochs + 1):
+            frac = min(1.0, epoch / max(1, eps_decay_epochs))
+            eps = eps_start + (eps_end - eps_start) * frac
+
+            days = np.random.choice(self.D, size=rollouts_per_epoch, replace=True)
+            for d in days:
+                if stock_subsample is None or stock_subsample >= self.N:
+                    self.rollout_day(int(d), eps)
+                else:
+                    # Subsample stocks for speed
+                    N_idx = np.random.choice(self.N, size=stock_subsample, replace=False)
+                    w = normalize_neutral(self.init_w_raw[int(d)])
+                    exited = np.zeros(self.N, dtype=bool)
+                    cum_pnl = np.zeros(self.N, dtype=np.float32)
+                    for t in range(self.T):
+                        for i in N_idx:
+                            s_t = make_obs(self.scaler, self.signals, self.rets, int(d), t, int(i), exited[i], float(cum_pnl[i]), self.T)
+                            with torch.no_grad():
+                                q_vals = self.q(torch.tensor(s_t, device=self.device).unsqueeze(0)).squeeze(0).cpu()
+                            a = self.epsilon_greedy(q_vals, eps)
+                            r = 0.0
+                            if (a == 1) and (not exited[i]):
+                                r -= self.exit_cost
+                                exited[i] = True
+                                w[i] = 0.0
+                            if not exited[i]:
+                                pnl_ti = float(w[i] * self.rets[int(d), t, int(i)])
+                                r += pnl_ti
+                                cum_pnl[i] += pnl_ti
+                            done = (t == self.T - 1)
+                            s_tp1 = make_obs(self.scaler, self.signals, self.rets, int(d), min(t+1, self.T-1), int(i), exited[i], float(cum_pnl[i]), self.T) if not done else np.zeros_like(s_t)
+                            self.buffer.push(s_t, a, r, s_tp1, done)
+
+            losses = []
+            updates = max(1, rollouts_per_epoch * 2)
+            for _ in range(updates):
+                l = self.train_step(batch_size=batch_size, double_dqn=True)
+                if l is not None:
+                    losses.append(l)
+                self.soft_update(tau=target_tau)
+
+            if epoch % eval_every == 0:
+                avg = self.evaluate(n_days=64)
+                avg_loss = float(np.mean(losses)) if losses else float("nan")
+                print(f"Epoch {epoch:03d} | Buffer {len(self.buffer)} | Loss {avg_loss:.6f} | Eval avg PnL {avg:.6f}")
+
+# ---------------------- Usage ----------------------
+def main():
+    D, T, N = 300, 8, 1000
+    signals, intraday_returns, init_weights = make_synthetic_data(D=D, T=T, N=N, seed=123)
+
+    agent = PerStockDQN(
+        signals=signals,
+        intraday_returns=intraday_returns,
+        init_weights=init_weights,
+        costs_bps=1.0,  # exit cost per stock
+        gamma=1.0,
+        device="cpu",
+        seed=7,
+    )
+    agent.train(
+        epochs=150,
+        eps_start=0.2,
+        eps_end=0.01,
+        eps_decay_epochs=120,
+        batch_size=2048,
+        rollouts_per_epoch=64,
+        target_tau=0.01,
+        eval_every=10,
+        stock_subsample=128,  # for speed; set to None to use all stocks each step
+    )
+    final = agent.evaluate(n_days=100)
+    print(f"Final evaluation avg PnL per day: {final:.6f}")
+
+if __name__ == "__main__":
+    main()
