@@ -1,400 +1,421 @@
+# Requirements:
+# pip install numpy torch
+
+from __future__ import annotations
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-from sklearn.utils.class_weight import compute_class_weight
-import numpy as np
-
-class PriceMovementDataset(Dataset):
-    def __init__(self, data, labels):
-        self.data = data
-        self.labels = labels
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return {'input': torch.tensor(self.data[idx], dtype=torch.float32), 'label': torch.tensor(self.labels[idx], dtype=torch.long)}
-
-class TransformerModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, n_layers, dropout=0.2):
-        super(TransformerModel, self).__init__()
-        self.transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=input_dim, nhead=8), num_layers=2)
-        self.fc = nn.Linear(input_dim, output_dim)
-
-    def forward(self, x):
-        x = self.transformer(x)
-        x = x[:, -1, :]
-        x = self.fc(x)
-        return x
-
-class LSTMModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, n_layers, dropout=0.2):
-        super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, n_layers, batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        x, _ = self.lstm(x)
-        x = x[:, -1, :]
-        x = self.fc(x)
-        return x
-
-class GRUModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, n_layers, dropout=0.2):
-        super(GRUModel, self).__init__()
-        self.gru = nn.GRU(input_dim, hidden_dim, n_layers, batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        x, _ = self.gru(x)
-        x = x[:, -1, :]
-        x = self.fc(x)
-        return x
-
-class RNNModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, n_layers, dropout=0.2):
-        super(RNNModel, self).__init__()
-        self.rnn = nn.RNN(input_dim, hidden_dim, n_layers, batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        x, _ = self.rnn(x)
-        x = x[:, -1, :]
-        x = self.fc(x)
-        return x
-
-data = np.random.rand(1000, 7, 10)  # (batch_size, seq_len, feature)
-labels = np.random.randint(0, 2, 1000)  # Binary classification
-dataset = PriceMovementDataset(data, labels)
-dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-class_weights = compute_class_weight('balanced', classes=np.unique(labels), y=labels)
-class_weights = torch.tensor(class_weights, dtype=torch.float)
-models = {
-    'Transformer': TransformerModel(input_dim=10, hidden_dim=20, output_dim=2, n_layers=2),
-    'LSTM': LSTMModel(input_dim=10, hidden_dim=20, output_dim=2, n_layers=2),
-    'GRU': GRUModel(input_dim=10, hidden_dim=20, output_dim=2, n_layers=2),
-    'RNN': RNNModel(input_dim=10, hidden_dim=20, output_dim=2, n_layers=2),
-}
-criterion = nn.CrossEntropyLoss(weight=class_weights)
-
-for model_name, model in models.items():
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    num_epochs = 10
-    print(f"Training {model_name} model:")
-    for epoch in range(num_epochs):
-        model.train()
-        for batch in dataloader:
-            inputs = batch['input']
-            targets = batch['label']
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-        print(f'Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}')
-
-
-
-
-import pandas as pd
-import numpy as np
-
-# Sample data generation (replace with your actual data)
-np.random.seed(0)
-dates = pd.date_range('2023-01-01', periods=200)
-returns = np.random.randn(200) / 100  # Assuming daily returns in decimal form (e.g., 0.01 for 1%)
-
-data = pd.DataFrame({'Date': dates, 'Return': returns}).set_index('Date')
-
-# Momentum Indicators
-def calculate_momentum(series, period=90):
-    return series - series.shift(period)
-
-data['momentum_90'] = calculate_momentum(data['Return'], 90)
-data['momentum_14'] = calculate_momentum(data['Return'], 14)
-data['momentum_30'] = calculate_momentum(data['Return'], 30)
-
-# Relative Strength Index (RSI)
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-data['rsi_14'] = calculate_rsi(data['Return'])
-
-# Moving Averages
-data['sma_90'] = data['Return'].rolling(window=90).mean()
-data['ema_90'] = data['Return'].ewm(span=90, adjust=False).mean()
-data['sma_30'] = data['Return'].rolling(window=30).mean()
-data['ema_30'] = data['Return'].ewm(span=30, adjust=False).mean()
-
-# Bollinger Bands
-def calculate_bollinger_bands(series, window=20, num_std=2):
-    rolling_mean = series.rolling(window).mean()
-    rolling_std = series.rolling(window).std()
-    upper_band = rolling_mean + (rolling_std * num_std)
-    lower_band = rolling_mean - (rolling_std * num_std)
-    return upper_band, rolling_mean, lower_band
-
-data['bb_high'], data['bb_mid'], data['bb_low'] = calculate_bollinger_bands(data['Return'])
-
-# Average True Range (ATR) approximation using returns only
-def calculate_atr(return_series, period=14):
-    true_range = return_series.abs()
-    atr = true_range.rolling(window=period).mean()
-    return atr
-
-data['atr_14'] = calculate_atr(data['Return'])
-
-# MACD
-def calculate_macd(series, fast_period=12, slow_period=26, signal_period=9):
-    fast_ema = series.ewm(span=fast_period, adjust=False).mean()
-    slow_ema = series.ewm(span=slow_period, adjust=False).mean()
-    macd = fast_ema - slow_ema
-    signal = macd.ewm(span=signal_period, adjust=False).mean()
-    macd_diff = macd - signal
-    return macd, signal, macd_diff
-
-data['macd'], data['macd_signal'], data['macd_diff'] = calculate_macd(data['Return'])
-
-# Drop rows with NaN values (first few days will have NaNs due to rolling calculations)
-data.dropna(inplace=True)
-
-# Display the data with calculated indicators
-print(data.tail())
-
-# Plot the data (optional)
-import matplotlib.pyplot as plt
-
-plt.figure(figsize=(14, 10))
-
-# Plot Returns with SMA and EMA
-plt.subplot(3, 1, 1)
-plt.plot(data['Return'], label='Return')
-plt.plot(data['sma_90'], label='SMA 90', linestyle='--')
-plt.plot(data['ema_90'], label='EMA 90', linestyle='--')
-plt.title('Returns and Moving Averages')
-plt.legend()
-
-# Plot Momentum
-plt.subplot(3, 1, 2)
-plt.plot(data['momentum_90'], label='Momentum 90', color='orange')
-plt.plot(data['rsi_14'], label='RSI 14', color='green')
-plt.title('Momentum Indicators')
-plt.legend()
-
-# Plot Volatility and Trend Indicators
-plt.subplot(3, 1, 3)
-plt.plot(data['atr_14'], label='ATR 14', color='purple')
-plt.plot(data['macd'], label='MACD', color='blue')
-plt.plot(data['macd_signal'], label='MACD Signal', color='red')
-plt.title('Volatility and Trend Indicators')
-plt.legend()
-
-plt.tight_layout()
-plt.show()
-
-
-
-Sure, I'll walk you through creating a backtest strategy using a classification signal (up, no movement, down) and then calculating various performance metrics such as information ratio, cumulative return, maximum drawdown, Sortino ratio, Sharpe ratio, and volatility.
-
-Let's assume:
-
-You have a signal that predicts the market movement.
-You have historical price data for the asset you’re trading.
-Step-by-Step Explanation
-Data Preparation: Load and prepare the historical price data and the signal.
-Signal Interpretation: Translate the signal into trading actions.
-Backtest Strategy: Implement the trading strategy based on the signal.
-Performance Metrics Calculation: Calculate the required performance metrics.
-Performance Metrics Formulas
-Code Implementation
-Here's a Python script using pandas for data handling and numpy for numerical calculations:
-
-python
-
-Copy
-import pandas as pd
-import numpy as np
-
-# Sample data (replace with actual data)
-# Assuming 'price' is the historical price data and 'signal' is the classification signal
-data = pd.DataFrame({
-    'price': [100, 102, 101, 103, 104, 102, 105, 107, 106, 108],
-    'signal': ['up', 'up', 'no movement', 'up', 'up', 'down', 'up', 'up', 'down', 'up']
-})
-
-# Calculate daily returns
-data['return'] = data['price'].pct_change()
-data = data.dropna()
-
-# Convert signals to trading actions
-data['position'] = data['signal'].map({'up': 1, 'no movement': 0, 'down': -1})
-
-# Calculate strategy returns
-data['strategy_return'] = data['position'].shift(1) * data['return']
-data['strategy_return'] = data['strategy_return'].fillna(0)
-
-# Calculate cumulative return
-cumulative_return = (1 + data['strategy_return']).cumprod()[-1] - 1
-
-# Calculate volatility
-volatility = data['strategy_return'].std()
-
-# Calculate Sharpe Ratio (assuming risk-free rate is 0 for simplicity)
-sharpe_ratio = data['strategy_return'].mean() / volatility
-
-# Calculate Sortino Ratio
-downside_risk = data.loc[data['strategy_return'] < 0, 'strategy_return'].std()
-sortino_ratio = data['strategy_return'].mean() / downside_risk
-
-# Calculate Maximum Drawdown
-data['cumulative_return'] = (1 + data['strategy_return']).cumprod()
-data['cumulative_max'] = data['cumulative_return'].cummax()
-data['drawdown'] = data['cumulative_max'] - data['cumulative_return']
-data['drawdown_pct'] = data['drawdown'] / data['cumulative_max']
-max_drawdown = data['drawdown_pct'].max()
-
-# Calculate Information Ratio
-# Assuming 'benchmark_return' is the return of a benchmark strategy
-data['benchmark_return'] = 0  # Replace with actual benchmark return if available
-tracking_error = np.std(data['strategy_return'] - data['benchmark_return'])
-information_ratio = (data['strategy_return'].mean() - data['benchmark_return'].mean()) / tracking_error
-
-# Print performance metrics
-print("Cumulative Return: {:.2f}%".format(cumulative_return * 100))
-print("Volatility: {:.2f}%".format(volatility * 100))
-print("Sharpe Ratio: {:.2f}".format(sharpe_ratio))
-print("Sortino Ratio: {:.2f}".format(sortino_ratio))
-print("Maximum Drawdown: {:.2f}%".format(max_drawdown * 100))
-print("Information Ratio: {:.2f}".format(information_ratio))
-
-# Visualize cumulative returns
-import matplotlib.pyplot as plt
-
-plt.figure(figsize=(10, 6))
-plt.plot(data['cumulative_return'], label='Strategy')
-plt.plot((1 + data['benchmark_return']).cumprod(), label='Benchmark', linestyle='--')
-plt.legend()
-plt.show()
-Detailed Explanation
-Data Preparation:
-Load historical price data and the signal into a DataFrame.
-Calculate daily returns from price data.
-Signal Interpretation:
-Map the signal to trading positions: 1 for 'up', 0 for 'no movement', and -1 for 'down'.
-Backtest Strategy:
-Calculate strategy returns by shifting the position by one day (to simulate trading at the end of the day based on the previous day's signal).
-Calculate cumulative returns of the strategy.
-Performance Metrics Calculation:
-Cumulative Return: Calculate the cumulative product of (1 + strategy returns) and subtract 1.
-Volatility: Standard deviation of strategy returns.
-Sharpe Ratio: Mean of strategy returns divided by their standard deviation.
-Sortino Ratio: Mean of strategy returns divided by the standard deviation of negative returns.
-Maximum Drawdown: Calculate the drawdown from the cumulative returns and find the maximum.
-Information Ratio: Mean of the strategy returns minus the benchmark returns, divided by the tracking error (standard deviation of the difference between strategy and benchmark returns).
-This script provides a basic framework for backtesting a trading strategy based on a classification signal and calculating key performance metrics. Adjust and expand it according to the specifics of your data and requirements.
-
-what if now we change to a regression rather than give you label, I have a predicted number for future value
-
-
-If you have a predicted number for the future value rather than a classification signal (up, no movement, down), you can adapt the strategy and performance metrics calculation accordingly. Here, you will use the predicted future price to make trading decisions.
-
-Step-by-Step Explanation
-Data Preparation: Load historical price data and the predicted future values.
-Signal Interpretation: Translate the predicted future prices into trading actions.
-Backtest Strategy: Implement the trading strategy based on the predicted future prices.
-Performance Metrics Calculation: Calculate the required performance metrics.
-Performance Metrics Formulas
-
- 
-Code Implementation
-Here's a Python script using pandas for data handling and numpy for numerical calculations:
-
-python
-
-Copy
-import pandas as pd
-import numpy as np
-
-# Sample data (replace with actual data)
-# Assuming 'price' is the historical price data and 'predicted_price' is the predicted future price
-data = pd.DataFrame({
-    'price': [100, 102, 101, 103, 104, 102, 105, 107, 106, 108],
-    'predicted_price': [102, 101, 103, 104, 102, 105, 107, 106, 108, 110]
-})
-
-# Calculate daily returns
-data['return'] = data['price'].pct_change()
-data = data.dropna()
-
-# Convert predicted prices to trading actions
-data['position'] = np.where(data['predicted_price'] > data['price'], 1, -1)
-
-# Calculate strategy returns
-data['strategy_return'] = data['position'].shift(1) * data['return']
-data['strategy_return'] = data['strategy_return'].fillna(0)
-
-# Calculate cumulative return
-cumulative_return = (1 + data['strategy_return']).cumprod()[-1] - 1
-
-# Calculate volatility
-volatility = data['strategy_return'].std()
-
-# Calculate Sharpe Ratio (assuming risk-free rate is 0 for simplicity)
-sharpe_ratio = data['strategy_return'].mean() / volatility
-
-# Calculate Sortino Ratio
-downside_risk = data.loc[data['strategy_return'] < 0, 'strategy_return'].std()
-sortino_ratio = data['strategy_return'].mean() / downside_risk
-
-# Calculate Maximum Drawdown
-data['cumulative_return'] = (1 + data['strategy_return']).cumprod()
-data['cumulative_max'] = data['cumulative_return'].cummax()
-data['drawdown'] = data['cumulative_max'] - data['cumulative_return']
-data['drawdown_pct'] = data['drawdown'] / data['cumulative_max']
-max_drawdown = data['drawdown_pct'].max()
-
-# Calculate Information Ratio
-# Assuming 'benchmark_return' is the return of a benchmark strategy
-data['benchmark_return'] = 0  # Replace with actual benchmark return if available
-tracking_error = np.std(data['strategy_return'] - data['benchmark_return'])
-information_ratio = (data['strategy_return'].mean() - data['benchmark_return'].mean()) / tracking_error
-
-# Print performance metrics
-print("Cumulative Return: {:.2f}%".format(cumulative_return * 100))
-print("Volatility: {:.2f}%".format(volatility * 100))
-print("Sharpe Ratio: {:.2f}".format(sharpe_ratio))
-print("Sortino Ratio: {:.2f}".format(sortino_ratio))
-print("Maximum Drawdown: {:.2f}%".format(max_drawdown * 100))
-print("Information Ratio: {:.2f}".format(information_ratio))
-
-# Visualize cumulative returns
-import matplotlib.pyplot as plt
-
-plt.figure(figsize=(10, 6))
-plt.plot(data['cumulative_return'], label='Strategy')
-plt.plot((1 + data['benchmark_return']).cumprod(), label='Benchmark', linestyle='--')
-plt.legend()
-plt.show()
-Detailed Explanation
-Data Preparation:
-Load historical price data and the predicted future prices into a DataFrame.
-Calculate daily returns from price data.
-Signal Interpretation:
-Map the predicted future prices to trading positions: 1 for predicted future price greater than current price, and -1 for predicted future price less than current price.
-Backtest Strategy:
-Calculate strategy returns by shifting the position by one day (to simulate trading at the end of the day based on the previous day's predicted price).
-Calculate cumulative returns of the strategy.
-Performance Metrics Calculation:
-Cumulative Return: Calculate the cumulative product of (1 + strategy returns) and subtract 1.
-Volatility: Standard deviation of strategy returns.
-Sharpe Ratio: Mean of strategy returns divided by their standard deviation.
-Sortino Ratio: Mean of strategy returns divided by the standard deviation of negative returns.
-Maximum Drawdown: Calculate the drawdown from the cumulative returns and find the maximum.
-Information Ratio: Mean of the strategy returns minus the benchmark returns, divided by the tracking error (standard deviation of the difference between strategy and benchmark returns).
-This script provides a basic framework for backtesting a trading strategy based on predicted future prices and calculating key performance metrics. Adjust and expand it according to the specifics of your data and requirements.
+from dataclasses import dataclass
+from typing import List, Tuple, Dict
+import random
+
+# ---------------------- Synthetic data (replace with real) ----------------------
+def make_synthetic_data(D=300, T=8, N=800, seed=123):
+    rng = np.random.default_rng(seed)
+    signals = rng.normal(0, 1, size=(D, N)).astype(np.float32)
+    # Overlapping intraday returns vs prior close: cumulative-ish path
+    alpha_daily = 0.02 * signals  # daily alpha per stock
+    frac = np.cumsum(rng.dirichlet(alpha=np.ones(T))).astype(np.float32)
+    frac = frac / frac[-1]
+    noise = rng.normal(0, 0.01, size=(D, T, N)).astype(np.float32)
+    intraday_returns = alpha_daily[:, None, :] * frac[None, :, :] + noise
+    init_w = signals.copy()  # will normalize to neutral per day
+    return signals.astype(np.float32), intraday_returns.astype(np.float32), init_w.astype(np.float32)
+
+# ---------------------- Weight normalization ----------------------
+def normalize_neutral(w: np.ndarray) -> np.ndarray:
+    w = w.astype(np.float32).copy()
+    pos = w > 0
+    neg = w < 0
+    pos_sum = float(w[pos].sum()) if pos.any() else 0.0
+    neg_sum = float(w[neg].sum()) if neg.any() else 0.0
+    if pos_sum > 0: w[pos] /= pos_sum
+    if neg_sum < 0: w[neg] /= -neg_sum
+    return w
+
+# ---------------------- Features (raw; BN will normalize inside the net) ----------------------
+def make_features_and_context(
+    signals: np.ndarray, rets: np.ndarray,
+    d: int, t: int, exited_mask: np.ndarray, w: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    sig_d = signals[d]                    # (N,)
+    N = sig_d.shape[0]
+    # Raw per-stock stats
+    sig_mean = float(sig_d.mean())
+    sig_std = float(sig_d.std() + 1e-12)
+    sig_z_all = (sig_d - sig_mean) / sig_std
+    ranks_all = np.argsort(np.argsort(sig_d)) / max(1, N - 1)
+
+    rt = rets[d, t]  # (N,)
+    stats = np.array([
+        np.nanmean(rt),
+        np.nanstd(rt) + 1e-12,
+        np.nanpercentile(rt, 10),
+        np.nanpercentile(rt, 50),
+        np.nanpercentile(rt, 90),
+    ], dtype=np.float32)
+
+    # Context: EOD-oriented (fractions exited)
+    long_mask_all = (w > 0)
+    short_mask_all = (w < 0)
+    frac_exited_long = float(np.mean(long_mask_all & exited_mask)) if np.any(long_mask_all) else 0.0
+    frac_exited_short = float(np.mean(short_mask_all & exited_mask)) if np.any(short_mask_all) else 0.0
+
+    context = np.concatenate([
+        stats, np.array([frac_exited_long, frac_exited_short], dtype=np.float32)
+    ], axis=0)  # dim 7
+
+    # Build per-stock features: [signal, z, rank, stats(5), exited_flag, sign_flag]
+    exited_flag = exited_mask.astype(np.float32)
+    sign_flag = np.sign(w).astype(np.float32)
+    stock_feats = np.stack([
+        sig_d.astype(np.float32),
+        sig_z_all.astype(np.float32),
+        ranks_all.astype(np.float32),
+        np.full(N, stats[0], dtype=np.float32),
+        np.full(N, stats[1], dtype=np.float32),
+        np.full(N, stats[2], dtype=np.float32),
+        np.full(N, stats[3], dtype=np.float32),
+        np.full(N, stats[4], dtype=np.float32),
+        exited_flag,
+        sign_flag,
+    ], axis=1)  # (N, 10)
+
+    return stock_feats, context  # context dim = 7
+
+# ---------------------- PPO model with BatchNorm ----------------------
+class ActorCritic(nn.Module):
+    def __init__(self, stock_feat_dim: int, context_dim: int, hidden: int = 256):
+        super().__init__()
+        # Context pathway (with BN)
+        self.ctx_fc1 = nn.Linear(context_dim + 1, hidden)
+        self.ctx_bn1 = nn.BatchNorm1d(hidden)
+        self.ctx_fc2 = nn.Linear(hidden, hidden)
+        self.ctx_bn2 = nn.BatchNorm1d(hidden)
+        self.ctx_act = nn.ReLU()
+
+        # Per-stock tower (shared) with BN over feature dimension
+        self.stock_fc1 = nn.Linear(stock_feat_dim + hidden, hidden)
+        self.stock_bn1 = nn.BatchNorm1d(hidden)
+        self.stock_fc2 = nn.Linear(hidden, hidden)
+        self.stock_bn2 = nn.BatchNorm1d(hidden)
+        self.stock_act = nn.ReLU()
+
+        self.logit_head = nn.Linear(hidden, 1)  # per-stock Bernoulli logit
+
+        # Value head from context embedding
+        self.v_fc1 = nn.Linear(hidden, hidden)
+        self.v_bn1 = nn.BatchNorm1d(hidden)
+        self.v_fc2 = nn.Linear(hidden, 1)
+
+    def encode_context(self, context: torch.Tensor) -> torch.Tensor:
+        # context: (B, Fc+1)
+        x = self.ctx_fc1(context)                 # (B, H)
+        x = self.ctx_bn1(x)
+        x = self.ctx_act(x)
+        x = self.ctx_fc2(x)
+        x = self.ctx_bn2(x)
+        x = self.ctx_act(x)
+        return x  # (B, H)
+
+    def forward_policy(self, stock_feats: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        # stock_feats: (B, N, Fs), context: (B, Fc+1)
+        B, N, Fs = stock_feats.shape
+        ctx = self.encode_context(context)                    # (B, H)
+        ctx_exp = ctx.unsqueeze(1).expand(B, N, ctx.shape[-1])  # (B, N, H)
+        x = torch.cat([stock_feats, ctx_exp], dim=-1)         # (B, N, Fs+H)
+        # Merge batch and stock dims for BN over features
+        x = x.reshape(B * N, -1)
+        x = self.stock_fc1(x)
+        x = self.stock_bn1(x)
+        x = self.stock_act(x)
+        x = self.stock_fc2(x)
+        x = self.stock_bn2(x)
+        x = self.stock_act(x)
+        logits = self.logit_head(x).reshape(B, N)             # (B, N)
+        return logits
+
+    def forward_value(self, context: torch.Tensor) -> torch.Tensor:
+        ctx = self.encode_context(context)     # (B, H)
+        v = self.v_fc1(ctx)
+        v = self.v_bn1(v)
+        v = torch.relu(v)
+        v = self.v_fc2(v).squeeze(-1)          # (B,)
+        return v
+
+# ---------------------- PPO agent with EOD objective (no exit costs) ----------------------
+class FactorizedPPOEOD:
+    def __init__(
+        self,
+        signals: np.ndarray,          # (D, N)
+        intraday_returns: np.ndarray, # (D, T, N), overlapping vs prior close
+        init_weights: np.ndarray,     # (D, N)
+        gamma: float = 1.0,
+        lam: float = 0.95,
+        device: str = "cpu",
+        seed: int = 7,
+    ):
+        random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+        self.device = torch.device(device)
+
+        self.signals = signals
+        self.rets = intraday_returns
+        self.init_w_raw = init_weights
+        self.D, self.T, self.N = intraday_returns.shape
+        assert signals.shape == (self.D, self.N)
+        assert init_weights.shape == (self.D, self.N)
+
+        self.gamma = gamma
+        self.lam = lam
+
+        self.stock_feat_dim = 10
+        self.context_dim = 7
+        self.model = ActorCritic(self.stock_feat_dim, self.context_dim, hidden=256).to(self.device)
+        self.optim = optim.Adam(self.model.parameters(), lr=3e-4)
+
+        # PPO hyperparameters
+        self.clip_eps = 0.2
+        self.ent_coef = 0.0005
+        self.vf_coef = 0.5
+        self.max_grad_norm = 1.0
+
+    def rollout_days(self, days_idx: np.ndarray, stock_subsample: int | None = None) -> Dict[str, List]:
+        self.model.train()
+        store = {
+            "logp": [], "ent": [], "value": [], "context": [], "stock_feats": [],
+            "actions": [], "masks": [], "day_boundaries": [], "rewards": []
+        }
+
+        for d in days_idx:
+            w = normalize_neutral(self.init_w_raw[d])
+            exited = np.zeros(self.N, dtype=bool)
+            first_exit_time = np.full(self.N, fill_value=-1, dtype=np.int32)
+
+            per_day_logp = []
+            per_day_ent = []
+            per_day_value = []
+            per_day_context = []
+            per_day_stock_feats = []
+            per_day_actions = []
+            per_day_masks = []
+
+            for t in range(self.T):
+                if stock_subsample is None or stock_subsample >= self.N:
+                    idx = np.arange(self.N)
+                else:
+                    idx = np.random.choice(self.N, size=stock_subsample, replace=False)
+                mask = np.zeros(self.N, dtype=np.float32)
+                mask[idx] = 1.0
+
+                stock_feats_np, context_np = make_features_and_context(
+                    self.signals, self.rets, int(d), int(t), exited, w
+                )
+                time_progress = np.float32(t / (self.T - 1 if self.T > 1 else 1))
+                context_plus_time = np.concatenate([context_np, np.array([time_progress], dtype=np.float32)], axis=0)
+
+                stock_feats = torch.tensor(stock_feats_np, dtype=torch.float32, device=self.device).unsqueeze(0)  # (1, N, Fs)
+                context = torch.tensor(context_plus_time, dtype=torch.float32, device=self.device).unsqueeze(0)    # (1, Fc+1)
+
+                logits = self.model.forward_policy(stock_feats, context)  # (1, N)
+                probs = torch.sigmoid(logits)
+                bern = torch.distributions.Bernoulli(probs=probs)
+
+                mask_t = torch.tensor(mask, dtype=torch.float32, device=self.device).unsqueeze(0)
+                active_tensor = torch.tensor((~exited).astype(np.float32), device=self.device).unsqueeze(0)
+
+                actions = (bern.sample() * active_tensor * mask_t).detach()  # (1, N)
+                logp = bern.log_prob(actions).squeeze(0) * (active_tensor.squeeze(0) * mask_t.squeeze(0))
+                ent = bern.entropy().squeeze(0) * (active_tensor.squeeze(0) * mask_t.squeeze(0))
+                value = self.model.forward_value(context).squeeze(0)
+
+                a_np = actions.squeeze(0).cpu().numpy().astype(bool)
+                exits_now = a_np & (~exited)
+                if np.any(exits_now):
+                    newly_exited_idx = np.where(exits_now)[0]
+                    first_exit_time[newly_exited_idx] = np.where(first_exit_time[newly_exited_idx] == -1,
+                                                                t, first_exit_time[newly_exited_idx])
+                    exited[exits_now] = True
+
+                per_day_logp.append(logp.sum())
+                per_day_ent.append(ent.sum())
+                per_day_value.append(value)
+                per_day_context.append(context.squeeze(0))
+                per_day_stock_feats.append(stock_feats.squeeze(0))
+                per_day_actions.append(actions.squeeze(0))
+                per_day_masks.append(mask_t.squeeze(0))
+
+            # End of day: EOD payoff (no exit costs)
+            payoff_time = np.where(first_exit_time >= 0, first_exit_time, self.T - 1)
+            terminal_pnls = w * self.rets[int(d), payoff_time, np.arange(self.N)]
+            eod_reward = float(np.sum(terminal_pnls))
+
+            day_rewards = [torch.tensor(0.0, dtype=torch.float32, device=self.device) for _ in range(self.T - 1)]
+            day_rewards.append(torch.tensor(eod_reward, dtype=torch.float32, device=self.device))
+
+            store["logp"].extend(per_day_logp)
+            store["ent"].extend(per_day_ent)
+            store["value"].extend(per_day_value)
+            store["context"].extend(per_day_context)
+            store["stock_feats"].extend(per_day_stock_feats)
+            store["actions"].extend(per_day_actions)
+            store["masks"].extend(per_day_masks)
+            store["rewards"].extend(day_rewards)
+            store["day_boundaries"].append(len(store["rewards"]))
+
+        return store
+
+    def compute_gae(self, store: Dict[str, List]):
+        rewards = torch.stack(store["rewards"])    # (Ttot,)
+        values = torch.stack(store["value"])       # (Ttot,)
+        Ttot = rewards.shape[0]
+
+        terminals = torch.zeros(Ttot, dtype=torch.float32, device=values.device)
+        for end in store["day_boundaries"]:
+            terminals[end - 1] = 1.0
+
+        next_values = torch.cat([values[1:], torch.zeros(1, device=values.device)])
+        deltas = rewards + self.gamma * (1.0 - terminals) * next_values - values
+
+        adv = torch.zeros_like(rewards)
+        last_adv = 0.0
+        for t in reversed(range(Ttot)):
+            mask = 1.0 - terminals[t]
+            last_adv = deltas[t] + self.gamma * self.lam * mask * last_adv
+            adv[t] = last_adv
+        ret = adv + values
+
+        store["adv"] = (adv - adv.mean()) / (adv.std() + 1e-8)
+        store["ret"] = ret
+
+    def ppo_update(self, store: Dict[str, List], epochs: int = 8, batch_size: int = 1024):
+        logp_old = torch.stack(store["logp"])       # (T,)
+        values_old = torch.stack(store["value"])    # (T,)
+        adv = store["adv"].detach()
+        ret = store["ret"].detach()
+        contexts = torch.stack(store["context"])    # (T, Fc+1)
+        stock_feats_list = torch.stack(store["stock_feats"])  # (T, N, Fs)
+        actions_list = torch.stack(store["actions"])          # (T, N)
+        masks_list = torch.stack(store["masks"])              # (T, N)
+
+        Ttot = logp_old.shape[0]
+        idx = np.arange(Ttot)
+
+        for _ in range(epochs):
+            np.random.shuffle(idx)
+            for start in range(0, Ttot, batch_size):
+                b = idx[start:start + batch_size]
+                if len(b) == 0: continue
+
+                ctx_b = contexts[b].to(self.device)
+                feats_b = stock_feats_list[b].to(self.device)
+                acts_b = actions_list[b].to(self.device)
+                masks_b = masks_list[b].to(self.device)
+                adv_b = adv[b].to(self.device)
+                ret_b = ret[b].to(self.device)
+                logp_old_b = logp_old[b].to(self.device)
+
+                logits = self.model.forward_policy(feats_b, ctx_b)
+                probs = torch.sigmoid(logits)
+                bern = torch.distributions.Bernoulli(probs=probs)
+                logp_all = bern.log_prob(acts_b) * masks_b
+                ent_all = bern.entropy() * masks_b
+                logp_new = logp_all.sum(dim=1)
+                ent_b = ent_all.sum(dim=1)
+
+                ratio = torch.exp(logp_new - logp_old_b)
+                unclipped = ratio * adv_b
+                clipped = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_b
+                pi_loss = -torch.mean(torch.min(unclipped, clipped))
+
+                values_new = self.model.forward_value(ctx_b)
+                v_loss = 0.5 * torch.mean((values_new - ret_b) ** 2)
+
+                ent_bonus = torch.mean(ent_b)
+                loss = pi_loss + self.vf_coef * v_loss - self.ent_coef * ent_bonus
+
+                self.optim.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.optim.step()
+
+    def train(
+        self,
+        epochs: int = 100,
+        rollouts_per_epoch: int = 64,
+        ppo_epochs: int = 8,
+        batch_size: int = 1024,
+        stock_subsample: int | None = 128,
+        eval_every: int = 10,
+    ):
+        for ep in range(1, epochs + 1):
+            days = np.random.choice(self.D, size=rollouts_per_epoch, replace=True)
+            store = self.rollout_days(days_idx=days, stock_subsample=stock_subsample)
+            self.compute_gae(store)
+            self.ppo_update(store, epochs=ppo_epochs, batch_size=batch_size)
+
+            if ep % eval_every == 0:
+                avg = self.evaluate(n_days=64)
+                print(f"Epoch {ep:03d} | Eval avg EOD PnL {avg:.6f}")
+
+    def evaluate(self, n_days: int = 64) -> float:
+        # EOD metric: payoff uses exit time return or last snap return; no costs; no rebalancing
+        self.model.eval()
+        totals = []
+        with torch.no_grad():
+            idx = np.random.choice(self.D, size=min(n_days, self.D), replace=False)
+            for d in idx:
+                w = normalize_neutral(self.init_w_raw[d])
+                exited = np.zeros(self.N, dtype=bool)
+                first_exit_time = np.full(self.N, fill_value=-1, dtype=np.int32)
+                for t in range(self.T):
+                    stock_feats_np, context_np = make_features_and_context(
+                        self.signals, self.rets, int(d), int(t), exited, w
+                    )
+                    time_progress = np.float32(t / (self.T - 1 if self.T > 1 else 1))
+                    context_plus_time = np.concatenate([context_np, np.array([time_progress], dtype=np.float32)], axis=0)
+                    stock_feats = torch.tensor(stock_feats_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+                    context = torch.tensor(context_plus_time, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+                    logits = self.model.forward_policy(stock_feats, context)
+                    probs = torch.sigmoid(logits)
+                    actions = (probs > 0.5).float().squeeze(0).cpu().numpy().astype(bool)
+                    exits_now = actions & (~exited)
+                    if np.any(exits_now):
+                        newly_exited_idx = np.where(exits_now)[0]
+                        first_exit_time[newly_exited_idx] = np.where(first_exit_time[newly_exited_idx] == -1,
+                                                                    t, first_exit_time[newly_exited_idx])
+                        exited[exits_now] = True
+
+                payoff_time = np.where(first_exit_time >= 0, first_exit_time, self.T - 1)
+                terminal_pnls = w * self.rets[int(d), payoff_time, np.arange(self.N)]
+                totals.append(float(np.sum(terminal_pnls)))
+        return float(np.mean(totals))
+
+# ---------------------- Usage ----------------------
+def main():
+    D, T, N = 300, 8, 800
+    signals, intraday_returns, init_weights = make_synthetic_data(D=D, T=T, N=N, seed=123)
+
+    agent = FactorizedPPOEOD(
+        signals=signals,
+        intraday_returns=intraday_returns,
+        init_weights=init_weights,
+        gamma=1.0,
+        lam=0.95,
+        device="cpu",
+        seed=7,
+    )
+    agent.train(
+        epochs=100,
+        rollouts_per_epoch=64,
+        ppo_epochs=6,
+        batch_size=1024,
+        stock_subsample=128,  # speed; set None to use all stocks
+        eval_every=10,
+    )
+    final = agent.evaluate(n_days=100)
+    print(f"Final evaluation avg EOD PnL per day: {final:.6f}")
+
+if __name__ == "__main__":
+    main()
