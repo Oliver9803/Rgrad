@@ -1,0 +1,249 @@
+# Requirements:
+#   pip install numpy pandas torch scikit-learn
+# Note: If you don't want scikit-learn, you can remove it; it's used only for quantile bucketing.
+
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from typing import List, Tuple, Dict
+from sklearn.preprocessing import KBinsDiscretizer
+
+# -------------------------- Configuration --------------------------
+DEVICE = "cpu"
+SEED = 42
+torch.manual_seed(SEED); np.random.seed(SEED)
+
+# -------------------------- Example data generator --------------------------
+# Replace this with loading your real dataframe.
+def make_example_df(D=220, N=500, K=8, seed=7) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    days = np.arange(D)
+    stocks = np.arange(N)
+    rows = []
+    for d in days:
+        # Cross-sectional signal
+        pred = rng.normal(0, 1, size=N).astype(np.float32)
+        # Build overlapping intraday returns vs previous close
+        alpha = 0.02 * pred  # daily alpha aligned with pred
+        frac = np.cumsum(rng.dirichlet(np.ones(K))).astype(np.float32)
+        frac /= frac[-1]
+        noise = rng.normal(0, 0.01, size=(K, N)).astype(np.float32)
+        r_ts = alpha[None, :] * frac[:, None] + noise
+        for i in range(N):
+            row = {"day_id": int(d), "stock_id": int(i), "pred": float(pred[i])}
+            for t in range(K):
+                row[f"r_t{t+1}"] = float(r_ts[t, i])
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+# -------------------------- Utility: weights --------------------------
+def dollar_neutral_weights(pred_vec: np.ndarray) -> np.ndarray:
+    # Normalize to sum long = +1, sum short = -1
+    w = pred_vec.astype(np.float32).copy()
+    pos = w > 0
+    neg = w < 0
+    pos_sum = w[pos].sum() if np.any(pos) else 0.0
+    neg_sum = w[neg].sum() if np.any(neg) else 0.0
+    if pos_sum > 0: w[pos] /= pos_sum
+    if neg_sum < 0: w[neg] /= -neg_sum
+    return w
+
+# -------------------------- Feature engineering --------------------------
+def compute_cross_section_stats(df_day: pd.DataFrame, K: int) -> Dict[str, np.ndarray]:
+    # Compute per-snap mean/std for longs and shorts separately for robust z-scores
+    pred = df_day["pred"].values
+    side = np.sign(pred)
+    stats = {}
+    for t in range(1, K+1):
+        r = df_day[f"r_t{t}"].values
+        mask_long = side > 0
+        mask_short = side < 0
+        mu_l = np.nanmean(r[mask_long]) if np.any(mask_long) else 0.0
+        sd_l = np.nanstd(r[mask_long]) + 1e-8 if np.any(mask_long) else 1.0
+        mu_s = np.nanmean(r[mask_short]) if np.any(mask_short) else 0.0
+        sd_s = np.nanstd(r[mask_short]) + 1e-8 if np.any(mask_short) else 1.0
+        stats[f"mu_long_t{t}"] = mu_l
+        stats[f"sd_long_t{t}"] = sd_l
+        stats[f"mu_short_t{t}"] = mu_s
+        stats[f"sd_short_t{t}"] = sd_s
+    return stats
+
+def build_row_sequence_features(
+    row: pd.Series,
+    stats_day: Dict[str, np.ndarray],
+    K: int,
+    pred_bins: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build per-time-step features X_t and targets vector of overlapping returns r_t.
+    Returns:
+      X: shape (K, F), r_vec: shape (K,)
+    """
+    pred = float(row["pred"])
+    side = 1.0 if pred > 0 else (-1.0 if pred < 0 else 0.0)
+    abs_pred = abs(pred)
+
+    # Bucket by |pred| using provided bin edges (monotone aggressiveness)
+    # pred_bins produced from training set using KBinsDiscretizer
+    b = int(np.digitize([abs_pred], pred_bins, right=False)[0])  # in [0, n_bins]
+    n_bins = len(pred_bins) + 1
+    onehot = np.zeros(n_bins, dtype=np.float32)
+    onehot[np.clip(b, 0, n_bins-1)] = 1.0
+
+    r_vec = np.array([float(row[f"r_t{t}"]) for t in range(1, K+1)], dtype=np.float32)
+    X = []
+    for t in range(1, K+1):
+        r_t = float(row[f"r_t{t}"])
+        # side-specific z-score
+        if side >= 0:
+            mu = stats_day[f"mu_long_t{t}"]; sd = stats_day[f"sd_long_t{t}"]
+        else:
+            mu = stats_day[f"mu_short_t{t}"]; sd = stats_day[f"sd_short_t{t}"]
+        z_t = (r_t - mu) / sd
+        time_frac = (t - 1) / (K - 1 if K > 1 else 1)
+        xt = np.concatenate([
+            np.array([pred, abs_pred, side, r_t, z_t, time_frac], dtype=np.float32),
+            onehot.astype(np.float32)
+        ], axis=0)
+        X.append(xt)
+    X = np.stack(X, axis=0)  # (K, F)
+    return X, r_vec
+
+# -------------------------- Model: Hazard-based optimal stopping --------------------------
+class HazardNet(nn.Module):
+    def __init__(self, input_dim: int, hidden: int = 128, n_layers: int = 2):
+        super().__init__()
+        layers = []
+        d = input_dim
+        for _ in range(n_layers):
+            layers += [nn.Linear(d, hidden), nn.LayerNorm(hidden), nn.ReLU()]
+            d = hidden
+        self.backbone = nn.Sequential(*layers)
+        self.hazard_head = nn.Linear(d, 1)  # per time-step logit
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        # X: (B, K, F)
+        B, K, F = X.shape
+        x = X.reshape(B * K, F)
+        h = self.backbone(x)
+        logits = self.hazard_head(h)                # (B*K, 1)
+        hazards = torch.sigmoid(logits).reshape(B, K)  # (B, K), values in (0,1)
+        return hazards
+
+def expected_payoff_from_hazard(h: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+    """
+    h: (B, K) hazards per snap (prob of exit at t given survival to t)
+    r: (B, K) overlapping returns r_t
+    Returns E[ r_exit ] per sample: (B,)
+    """
+    B, K = h.shape
+    # Survival S_t = prod_{j< t} (1 - h_j); define S_1 = 1
+    one_minus_h = 1.0 - h
+    # Cumprod across time with S_1 = 1. We need S_t at each t: product of (1-h) up to t-1.
+    S = torch.ones_like(h)
+    if K > 1:
+        S[:, 1:] = torch.cumprod(one_minus_h[:, :-1], dim=1)
+    # Prob(exit at t) = S_t * h_t
+    p_exit = S * h
+    # Prob(no exit) = S_{K+1} = prod_{j<=K} (1 - h_j)
+    p_no_exit = torch.cumprod(one_minus_h, dim=1)[:, -1]  # (B,)
+    # Expected r_exit = sum_t p_exit_t * r_t + p_no_exit * r_K
+    e_r = torch.sum(p_exit * r, dim=1) + p_no_exit * r[:, -1]
+    return e_r  # (B,)
+
+# -------------------------- Training and evaluation --------------------------
+def train_and_evaluate(df: pd.DataFrame, K: int = 8, epochs: int = 20, lr: float = 3e-4, batch_size: int = 2048):
+    # Split days: first 100 train, last 100 eval
+    all_days = np.sort(df["day_id"].unique())
+    assert len(all_days) >= 200, "Need at least 200 days to use first 100 train and last 100 eval."
+    train_days = all_days[:100]
+    eval_days = all_days[-100:]
+
+    # Build pred magnitude bins using training set
+    train_abs_pred = df.loc[df["day_id"].isin(train_days), "pred"].abs().values.reshape(-1, 1)
+    n_bins = 4
+    kb = KBinsDiscretizer(n_bins=n_bins, encode="ordinal", strategy="quantile")
+    kb.fit(train_abs_pred)
+    # Convert bin boundaries to scalar edges for digitize
+    # KBins outputs bin edges via quantiles. We'll extract from quantiles on train_abs_pred.
+    quantiles = np.quantile(train_abs_pred.flatten(), np.linspace(0, 1, n_bins + 1))
+    # Use interior edges for digitize (exclude min, max)
+    pred_bins = quantiles[1:-1]
+
+    # Collect training sequences
+    X_list, r_list, w_list = [], [], []
+    for d in train_days:
+        df_day = df[df["day_id"] == d].copy()
+        stats_day = compute_cross_section_stats(df_day, K)
+        pred_vec = df_day["pred"].values.astype(np.float32)
+        w = dollar_neutral_weights(pred_vec)
+        # align to df_day order
+        for idx, row in df_day.iterrows():
+            Xi, ri = build_row_sequence_features(row, stats_day, K, pred_bins)
+            X_list.append(Xi)
+            r_list.append(ri)
+            w_list.append(w[int(row["stock_id"])])
+    X_train = np.stack(X_list, axis=0).astype(np.float32)  # (B, K, F)
+    r_train = np.stack(r_list, axis=0).astype(np.float32)  # (B, K)
+    w_train = np.array(w_list, dtype=np.float32)           # (B,)
+    print(f"Train samples: {X_train.shape[0]}  K={K}  F={X_train.shape[2]}")
+
+    # Build model
+    input_dim = X_train.shape[2]
+    model = HazardNet(input_dim=input_dim, hidden=128, n_layers=2).to(DEVICE)
+    opt = optim.Adam(model.parameters(), lr=lr)
+    # We maximize expected portfolio PnL: sum_i w_i * E[r_exit_i].
+    # We'll minimize negative of that.
+    for ep in range(1, epochs + 1):
+        model.train()
+        # mini-batch SGD
+        idx = np.arange(X_train.shape[0])
+        np.random.shuffle(idx)
+        total_loss = 0.0
+        for start in range(0, len(idx), batch_size):
+            b = idx[start:start + batch_size]
+            xb = torch.tensor(X_train[b], device=DEVICE)
+            rb = torch.tensor(r_train[b], device=DEVICE)
+            wb = torch.tensor(w_train[b], device=DEVICE)
+            hazards = model(xb)  # (B, K)
+            e_r = expected_payoff_from_hazard(hazards, rb)  # (B,)
+            pnl = (wb * e_r).sum()  # scalar
+            loss = -pnl / xb.shape[0]  # normalize to keep scale stable
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            opt.step()
+            total_loss += loss.item() * len(b)
+        if ep % 2 == 0:
+            print(f"Epoch {ep:03d} | train objective (neg avg pnl) = {total_loss/len(idx):.6f}")
+
+    # Evaluation on last 100 days with greedy exits (hazard > 0.5)
+    model.eval()
+    totals = []
+    with torch.no_grad():
+        for d in eval_days:
+            df_day = df[df["day_id"] == d].copy()
+            stats_day = compute_cross_section_stats(df_day, K)
+            pred_vec = df_day["pred"].values.astype(np.float32)
+            w = dollar_neutral_weights(pred_vec)
+            pnl_day = 0.0
+            for _, row in df_day.iterrows():
+                Xi, ri = build_row_sequence_features(row, stats_day, K, pred_bins)
+                xb = torch.tensor(Xi[None, ...], device=DEVICE)  # (1, K, F)
+                hazards = model(xb).cpu().numpy().reshape(-1)     # (K,)
+                # Greedy rule: exit at first t where hazard > 0.5; else last snap
+                t_exit = np.argmax(hazards > 0.5) if np.any(hazards > 0.5) else (K - 1)
+                payoff = float(w[int(row["stock_id"])]) * float(ri[t_exit])
+                pnl_day += payoff
+            totals.append(pnl_day)
+    print(f"Eval (last 100 days) avg EOD PnL per day: {np.mean(totals):.6f}")
+    return model, pred_bins
+
+# -------------------------- Run demo --------------------------
+if __name__ == "__main__":
+    # Replace with your real dataframe (columns: day_id, stock_id, pred, r_t1..r_tK)
+    df = make_example_df(D=220, N=400, K=8, seed=7)
+    model, pred_bins = train_and_evaluate(df, K=8, epochs=20, lr=3e-4, batch_size=4096)
